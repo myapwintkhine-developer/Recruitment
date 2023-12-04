@@ -1,0 +1,173 @@
+CREATE DEFINER=`root`@`localhost` PROCEDURE `candidate_summary_combined_filter`(
+    IN vacancyId BIGINT, 
+    IN positionId INT, 
+    IN departmentId INT, 
+    IN interviewStage INT,
+    IN selectionStatus VARCHAR(255),
+    IN interviewStatus VARCHAR(255),
+    IN startDate DATE,
+    IN endDate DATE,
+    IN isEmploy TINYINT,
+    IN isRecall TINYINT
+)
+BEGIN
+    SELECT 
+        ROW_NUMBER() OVER (ORDER BY c.id) AS no,
+        c.*, 
+        d.name as department_name,
+        CASE 
+            WHEN c.gender = false THEN 'Male'
+            WHEN c.gender = true THEN 'Female'
+            ELSE '-'
+        END AS gender_text,
+        CASE i.stage
+            WHEN 1 THEN 'Stage 1'
+            WHEN 2 THEN 'Stage 2'
+            WHEN 3 THEN 'Stage 3'
+            WHEN 4 THEN 'Stage 4'
+            ELSE '-'
+        END AS interview_stage,
+        CASE 
+            WHEN ci.interview_date IS NULL THEN '-'
+            ELSE ci.interview_date
+        END AS interview_date,
+        p.name AS position_name,
+        CASE 
+            WHEN ci.id IS NULL THEN s.name 
+            ELSE ci.status 
+        END AS combine_status,
+        CASE 
+            WHEN c.is_employ = true THEN 'Employed'
+            WHEN c.is_recall = true THEN 'Recalled'
+            ELSE '-'
+        END AS candidate_special_status
+    FROM candidate c
+    LEFT JOIN (
+        SELECT c.id AS candidate_id, MAX(ci.id) AS last_interview_id
+        FROM candidate c
+        LEFT JOIN candidate_interview ci ON c.id = ci.candidate_id
+        GROUP BY c.id
+    ) AS last_interviews ON c.id = last_interviews.candidate_id
+    LEFT JOIN (
+        SELECT cs1.candidate_id, MAX(cs1.id) AS last_status_id
+        FROM candidate_status cs1
+        GROUP BY cs1.candidate_id
+    ) AS last_statuses ON c.id = last_statuses.candidate_id
+    LEFT JOIN candidate_status cs ON last_statuses.last_status_id = cs.id
+    LEFT JOIN status s ON cs.status_id = s.id
+    LEFT JOIN candidate_interview ci ON last_interviews.last_interview_id = ci.id
+    LEFT JOIN interview i ON ci.interview_id = i.id
+    LEFT JOIN vacancy v ON c.vacancy_id = v.id
+    LEFT JOIN department d ON v.department_id = d.id
+    LEFT JOIN position p ON v.position_id = p.id
+    WHERE (v.id = vacancyId OR vacancyId IS NULL OR vacancyId = 0)
+      AND (p.id = positionId OR positionId IS NULL OR positionId = 0)
+      AND (d.id = departmentId OR departmentId IS NULL OR departmentId = 0)
+      AND (i.stage = interviewStage OR interviewStage IS NULL OR interviewStage = 0)
+      AND (ci.status = interviewStatus OR interviewStatus IS NULL OR interviewStatus = '-')
+      AND (s.name = selectionStatus OR selectionStatus IS NULL OR selectionStatus = '-')
+      AND (
+          (startDate IS NULL AND endDate IS NULL) OR
+          (endDate IS NULL AND c.submit_date = startDate) OR
+          (startDate IS NULL AND c.submit_date = endDate) OR
+          (startDate IS NOT NULL AND endDate IS NOT NULL AND c.submit_date BETWEEN startDate AND endDate)
+      )
+      AND (isEmploy IS NULL OR c.is_employ = isEmploy)
+      AND (isRecall IS NULL OR c.is_recall = isRecall);
+END
+
+-----------------------------------------------------------------------------------------------------------------
+
+
+
+CREATE DEFINER=`root`@`localhost` PROCEDURE `interview_process_date_filter`(
+    IN from_date_param DATE,
+    IN to_date_param DATE,
+    IN departmentId INT,
+    IN positionId INT,
+    IN status TINYINT,
+    IN reopen TINYINT,
+    IN urgent TINYINT
+)
+BEGIN
+    SELECT
+        DATE_FORMAT(v.created_date, '%d/%m/%Y') AS from_date,
+        DATE_FORMAT(v.due_date, '%d/%m/%Y') AS to_date,
+        p.name AS position_name,
+        COUNT(c.vacancy_id) AS total_received_candidate,
+        COALESCE(CAST(SUM(c.is_employ = 1) AS SIGNED), 0) AS offer_mail,
+        COALESCE(CAST(SUM(c.is_mail_sent = 1) AS SIGNED), 0) AS accepted_mail,
+        SUM(
+            CASE
+                WHEN last_interview.status = 'Passed' THEN 1
+                ELSE 0
+            END
+        ) AS passed_interview_count,
+        SUM(
+            CASE
+                WHEN last_interview.status = 'Pending' THEN 1
+                ELSE 0
+            END
+        ) AS pending_interview_count,
+        SUM(
+            CASE
+                WHEN last_interview.status = 'Cancel' THEN 1
+                ELSE 0
+            END
+        ) AS cancel_interview_count,
+        SUM(
+            CASE
+                WHEN last_interview.status = 'Reached' THEN 1
+                ELSE 0
+            END
+        ) AS reached_interview_count,
+        SUM(
+            CASE
+                WHEN last_interview.status IN ('Passed', 'Pending', 'Cancel') THEN 1
+                ELSE 0
+            END
+        ) AS interviewed_candidate,
+        COUNT(c.vacancy_id) - SUM(
+            CASE
+                WHEN last_interview.status IN ('Passed', 'Pending', 'Cancel') THEN 1
+                ELSE 0
+            END
+        ) AS left_to_view
+    FROM
+        vacancy v
+    LEFT JOIN
+        position p ON v.position_id = p.id
+    LEFT JOIN
+        candidate c ON v.id = c.vacancy_id
+    LEFT JOIN (
+        SELECT
+            ci.candidate_id,
+            ci.status
+        FROM
+            candidate_interview ci
+        WHERE
+            (ci.candidate_id, ci.id) IN (
+                SELECT
+                    candidate_id,
+                    MAX(id) AS max_id
+                FROM
+                    candidate_interview
+                GROUP BY
+                    candidate_id
+            )
+    ) AS last_interview ON c.id = last_interview.candidate_id
+    LEFT JOIN department d ON v.department_id = d.id
+    WHERE
+        (from_date_param IS NULL OR v.created_date >= from_date_param)
+        AND (to_date_param IS NULL OR v.created_date <= to_date_param)
+        AND (departmentId IS NULL OR departmentId = 0 OR d.id = departmentId)
+        AND (positionId IS NULL OR positionId = 0 OR p.id = positionId)
+        AND (status IS NULL OR (status = 1 AND v.active = 1) OR (status = 0 AND v.active = 0))
+AND (reopen IS NULL OR (reopen = 1 AND (v.reopen_status = 1 OR v.reopened = 1)))
+        AND (urgent IS NULL OR (urgent = 1 AND v.urgent = 1))
+    GROUP BY
+        v.id
+    ORDER BY
+        v.created_date;
+END
+
